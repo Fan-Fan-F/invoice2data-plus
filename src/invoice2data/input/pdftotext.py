@@ -171,8 +171,9 @@ def to_text(
         raise FileNotFoundError(f"File not found: {path}")
     if not shutil.which("pdftotext"):
         raise OSError(
-            "pdftotext not installed. "
-            "Can be downloaded from https://poppler.freedesktop.org/"
+            "pdftotext binary not found in PATH. Install poppler-utils: "
+            "'sudo apt-get install poppler-utils' (Debian/Ubuntu), "
+            "'brew install poppler' (macOS), or download from https://poppler.freedesktop.org/"
         )
 
     if area_details is not None:

@@ -1,6 +1,7 @@
 """JSON output module for invoice2data."""
 
 import datetime
+from decimal import Decimal
 import json
 from typing import Any
 
@@ -19,6 +20,8 @@ def format_item(item: Any, date_format: str) -> Any:
     """
     if isinstance(item, datetime.date):
         return item.strftime(date_format)
+    if isinstance(item, Decimal):
+        return float(item)
     if isinstance(item, dict | list):
         iter_obj = item.items() if isinstance(item, dict) else enumerate(item)
         for k, v in iter_obj:

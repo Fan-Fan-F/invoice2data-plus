@@ -10,6 +10,7 @@ existing import paths (``from invoice2data import extract_data``) via
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ DEFAULT_INPUT_READERS = [pdfium, pdftotext]
 __all__ = [
     "DEFAULT_INPUT_READERS",
     "Invoice2Data",
+    "explain_matching",
     "extract_data",
     "input_mapping",
 ]
@@ -59,6 +61,11 @@ def extract_data(  # noqa: C901
     input_module: Any = None,
     ai_fallback: bool = False,
     raise_on_error: bool = False,
+    readers: list[Any] | str | None = None,
+    standardize_types: bool = False,
+    use_decimal: bool = False,
+    date_to_iso: bool = False,
+    validate_schema: bool = False,
 ) -> dict[str, Any]:
     """Extracts structured data from PDF/image invoices.
 
@@ -87,6 +94,16 @@ def extract_data(  # noqa: C901
             instead of returning ``{}`` -- ``RequiredFieldsMissingError`` when a
             template matched but a required field could not be parsed, otherwise
             ``NoTemplateFoundError``. Defaults to False (the historical ``{}`` contract).
+        readers (list[Any] | str | None, optional): Custom cascade of backends
+            to try, or None to check INVOICE2DATA_INPUT_READERS / defaults.
+        standardize_types (bool, optional): When True, convert monetary/float
+            amounts to Decimal and dates to ISO 8601 strings. Defaults to False.
+        use_decimal (bool, optional): When True, convert monetary amounts to
+            high-precision Decimal. Defaults to False.
+        date_to_iso (bool, optional): When True, convert dates to ISO 8601
+            strings. Defaults to False.
+        validate_schema (bool, optional): When True, validate extraction output
+            against standard invoice JSON Schema. Defaults to False.
 
     Returns:
         dict[str, Any]: Extracted and matched fields, or an empty dict ``{}`` if
@@ -96,34 +113,31 @@ def extract_data(  # noqa: C901
     Raises:
         InvoiceProcessingError: When ``raise_on_error`` is True and extraction
             fails (``RequiredFieldsMissingError`` or ``NoTemplateFoundError``).
-
-    Notes:
-        Import the required `input_module` when using invoice2data as a library.
-        A template may pin the backend it was authored for with a top-level
-        ``input_module:`` key; that backend is then used for that template
-        regardless of which one matched it first.
-
-    See Also:
-        read_template: Function to load templates.
-        InvoiceTemplate: Class representing a single invoice template.
-
-    Examples:
-        When using `invoice2data` as a library:
-
-        >>> from invoice2data.input import pdftotext
-        >>> extract_data("./tests/compare/oyo.pdf", None, pdftotext)
-        {'issuer': 'OYO', 'template_name': 'com.oyo.invoice.yml', 'amount': 1939.0, 'date': datetime.datetime(2017, 12, 31, 0, 0), 'invoice_number': 'IBZY2087', 'currency': 'INR', 'hotel_details': ' OYO 4189 Resort Nanganallur', 'date_check_in': datetime.datetime(2017, 12, 31, 0, 0), 'date_check_out': datetime.datetime(2018, 1, 1, 0, 0), 'amount_rooms': 1.0, 'booking_id': 'IBZY2087', 'payment_method': 'Cash at Hotel', 'gstin': '06AABCO6063D1ZQ', 'cin': 'U63090DL2012PTC231770', 'desc': 'Invoice from OYO'}
-
     """
+    def _finalize(res: dict[str, Any]) -> dict[str, Any]:
+        if not res:
+            return res
+        if standardize_types or use_decimal or date_to_iso:
+            from .extract import schema
+            res = schema.standardize_output(
+                res,
+                use_decimal=(use_decimal or standardize_types),
+                date_to_iso=(date_to_iso or standardize_types),
+            )
+        if validate_schema:
+            from .extract import schema
+            schema.validate_invoice_schema(res, strict=raise_on_error)
+        return res
+
     templates = _by_priority(templates or read_templates())
-    readers = _resolve_readers(invoicefile, input_module)
+    readers_list = _resolve_readers(invoicefile, input_module, readers=readers)
     # Per-template backend pins apply only in auto (cascade) mode; an explicit
     # input_module forces that backend, pin or not.
     auto = input_module is None
     best: dict[str, Any] | None = None  # complete-but-lineless result, kept as fallback
     field_errors: list[RequiredFieldsMissingError] = []  # missing-fields reasons (#190)
 
-    for reader in readers:
+    for reader in readers_list:
         extracted_str = _safe_to_text(reader, invoicefile)
         if not extracted_str:
             continue
@@ -165,7 +179,7 @@ def extract_data(  # noqa: C901
             # layout-less backend dropped the table: keep the result but try the
             # next (layout) backend, which may recover the lines.
             if not auto or not _line_items_missing(template, result):
-                return result
+                return _finalize(result)
             best = best or result
             continue
         # Matched, but a required field was missing: fall through to the next
@@ -173,17 +187,17 @@ def extract_data(  # noqa: C901
 
     # A complete-but-lineless result beats OCR / nothing.
     if best is not None:
-        return best
+        return _finalize(best)
 
     # Nothing matched (or every match was incomplete): try OCR as a last resort.
-    result = _ocr_last_resort(invoicefile, templates, readers)
+    result = _ocr_last_resort(invoicefile, templates, readers_list)
     if result:
-        return result
+        return _finalize(result)
 
     # Opt-in AI fallback: let an LLM extract fields when no template fit.
     ai_result = _ai_last_resort(invoicefile, input_module, ai_fallback)
     if ai_result:
-        return ai_result
+        return _finalize(ai_result)
 
     logger.error("No template for %s", invoicefile)
     if raise_on_error:
@@ -215,13 +229,20 @@ def _ai_last_resort(
     return ai_fallback_extract(_sample_text(invoicefile, input_module))
 
 
-def _resolve_readers(invoicefile: str, input_module: Any) -> list[Any]:
+def _resolve_readers(
+    invoicefile: str,
+    input_module: Any = None,
+    readers: list[Any] | str | None = None,
+) -> list[Any]:
     """Return the ordered list of input backends to try for ``invoicefile``.
 
     Args:
         invoicefile (str): Path to the invoice file.
         input_module (Any): An explicit backend (module or registry name) to
-            force a single-backend pass, or ``None`` to use the default cascade.
+            force a single-backend pass, or ``None`` to use the cascade.
+        readers (list[Any] | str | None): Custom cascade of backends (as a list
+            of modules/names or a comma-separated string) or None to check
+            INVOICE2DATA_INPUT_READERS / DEFAULT_INPUT_READERS.
 
     Returns:
         list[Any]: Backends to try, in order.
@@ -232,8 +253,170 @@ def _resolve_readers(invoicefile: str, input_module: Any) -> list[Any]:
         return [input_module]
     if invoicefile.lower().endswith(".txt"):
         return [text]
-    readers = [module for module in DEFAULT_INPUT_READERS if is_available(module)]
-    return readers or [pdftotext]
+
+    cascade_spec = readers or os.environ.get("INVOICE2DATA_INPUT_READERS")
+    if cascade_spec:
+        if isinstance(cascade_spec, str):
+            names = [s.strip() for s in cascade_spec.split(",") if s.strip()]
+            resolved = []
+            for name in names:
+                if name in input_mapping:
+                    resolved.append(input_mapping[name])
+                else:
+                    logger.warning("Unknown backend in reader cascade: %s", name)
+        else:
+            resolved = [
+                input_mapping[r] if isinstance(r, str) else r for r in cascade_spec
+            ]
+        available = [m for m in resolved if is_available(m)]
+        if available:
+            return available
+
+    readers_avail = [module for module in DEFAULT_INPUT_READERS if is_available(module)]
+    return readers_avail or [pdftotext]
+
+
+def explain_matching(
+    invoicefile: str,
+    templates: list[InvoiceTemplate] | None = None,
+    input_module: Any = None,
+    readers: list[Any] | str | None = None,
+) -> dict[str, Any]:
+    """Diagnose template matching for an invoice file.
+
+    Evaluates text extraction and runs matching and field diagnosis across
+    available templates. Provides deep visibility into which keywords matched,
+    which keywords were missing, exclude_keywords triggers, and required field
+    status.
+
+    Args:
+        invoicefile (str): Path to the invoice file.
+        templates (list[InvoiceTemplate] | None): Templates to test against,
+            or None to load all built-in/registered templates.
+        input_module (Any): Forced input reader, or None to cascade.
+        readers (list[Any] | str | None): Custom reader cascade.
+
+    Returns:
+        dict[str, Any]: Diagnostic report containing:
+            - invoicefile: str
+            - reader: str (name of reader used to extract text)
+            - text_length: int
+            - matched: bool
+            - matched_template: str | None
+            - field_diagnostics: dict | None
+            - closest_candidates: list[dict]
+            - reason: str
+    """
+    templates = _by_priority(templates or read_templates())
+    readers_list = _resolve_readers(invoicefile, input_module, readers=readers)
+
+    extracted_str = ""
+    used_reader = None
+    for reader in readers_list:
+        extracted_str = _safe_to_text(reader, invoicefile)
+        if extracted_str:
+            used_reader = reader
+            break
+
+    if not extracted_str:
+        return {
+            "invoicefile": invoicefile,
+            "reader": None,
+            "text_length": 0,
+            "matched": False,
+            "matched_template": None,
+            "field_diagnostics": None,
+            "closest_candidates": [],
+            "reason": (
+                "Text extraction failed or produced empty text with all "
+                "configured readers."
+            ),
+        }
+
+    # Diagnose all templates
+    diagnoses = []
+    matched_template = None
+
+    for tmpl in templates:
+        diag = tmpl.diagnose_match(extracted_str)
+        diagnoses.append((tmpl, diag))
+        if diag["matched"] and matched_template is None:
+            matched_template = tmpl
+
+    field_diag = None
+    if matched_template is not None:
+        # Check if template pins a backend
+        preferred = (
+            _preferred_module(matched_template, used=used_reader)
+            if input_module is None
+            else None
+        )
+        diag_reader = used_reader
+        diag_str = extracted_str
+        if preferred is not None:
+            preferred_str = _safe_to_text(preferred, invoicefile)
+            if preferred_str:
+                diag_reader = preferred
+                diag_str = preferred_str
+        field_diag = matched_template.diagnose_fields(
+            diag_str, invoice_file=invoicefile, input_module=diag_reader
+        )
+
+    # Sort candidates by match_ratio descending
+    candidates = sorted(
+        diagnoses,
+        key=lambda item: (item[1]["match_ratio"], len(item[1]["keywords_matched"])),
+        reverse=True,
+    )
+
+    top_candidates = [
+        {
+            "template_name": cand[0].get("template_name", "<unknown>"),
+            "matched": cand[1]["matched"],
+            "keywords_matched": cand[1]["keywords_matched"],
+            "keywords_missing": cand[1]["keywords_missing"],
+            "exclude_keywords_matched": cand[1]["exclude_keywords_matched"],
+            "exclude_triggered": cand[1]["exclude_triggered"],
+            "match_ratio": cand[1]["match_ratio"],
+            "reason": cand[1]["reason"],
+        }
+        for cand in candidates[:10]
+    ]
+
+    if matched_template:
+        if field_diag and field_diag["success"]:
+            reason = (
+                f"Matched template {matched_template.get('template_name')} with all "
+                "required fields satisfied."
+            )
+        elif field_diag and field_diag["required_fields_missing"]:
+            reason = (
+                f"Matched template {matched_template.get('template_name')} on keywords, "
+                f"but missing required fields: {', '.join(field_diag['required_fields_missing'])}."
+            )
+        else:
+            reason = f"Matched template {matched_template.get('template_name')}."
+    else:
+        reason = "No template matched all required keywords without triggering exclude_keywords."
+
+    return {
+        "invoicefile": invoicefile,
+        "reader": (
+            getattr(used_reader, "__name__", str(used_reader))
+            if used_reader
+            else None
+        ),
+        "text_length": len(extracted_str),
+        "matched": bool(
+            matched_template and (field_diag is None or field_diag["success"])
+        ),
+        "matched_template": (
+            matched_template.get("template_name") if matched_template else None
+        ),
+        "field_diagnostics": field_diag,
+        "closest_candidates": top_candidates,
+        "reason": reason,
+    }
 
 
 def _safe_to_text(module: Any, invoicefile: str) -> str:

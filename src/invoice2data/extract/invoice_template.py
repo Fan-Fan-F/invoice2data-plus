@@ -193,11 +193,167 @@ class InvoiceTemplate(OrderedDictType[str, Any]):
         )
         return False
 
+    def diagnose_match(self, extracted_str: str) -> dict[str, Any]:
+        """Diagnose whether and why this template matches the extracted text.
+
+        Returns structured diagnostic details on keyword matching, missing
+        keywords, and any exclude_keywords triggered.
+
+        Args:
+            extracted_str (str): The extracted text from the invoice.
+
+        Returns:
+            dict[str, Any]: Structured diagnosis containing:
+                - template_name: str
+                - matched: bool
+                - keywords_matched: list[str]
+                - keywords_missing: list[str]
+                - exclude_keywords_matched: list[str]
+                - exclude_triggered: bool
+                - match_ratio: float (0.0 to 1.0)
+                - reason: str
+        """
+        keywords = self.get("keywords") or []
+        exclude_keywords = self.get("exclude_keywords") or []
+
+        matched_kws = [k for k in keywords if _keyword_matches(k, extracted_str)]
+        missing_kws = [k for k in keywords if not _keyword_matches(k, extracted_str)]
+        exclude_matched = [
+            k for k in exclude_keywords if _keyword_matches(k, extracted_str)
+        ]
+        exclude_triggered = bool(exclude_matched)
+
+        all_kws_matched = (len(missing_kws) == 0) if keywords else True
+        matched = all_kws_matched and not exclude_triggered
+
+        ratio = (
+            (len(matched_kws) / len(keywords))
+            if keywords
+            else (1.0 if not exclude_triggered else 0.0)
+        )
+
+        if matched:
+            reason = "All keywords matched and no exclude keywords triggered."
+        elif not all_kws_matched and exclude_triggered:
+            reason = (
+                f"Missing keywords ({', '.join(missing_kws)}) and "
+                f"exclude keywords triggered ({', '.join(exclude_matched)})."
+            )
+        elif not all_kws_matched:
+            reason = f"Missing keywords: {', '.join(missing_kws)}."
+        else:
+            reason = f"Exclude keywords triggered: {', '.join(exclude_matched)}."
+
+        return {
+            "template_name": self.get("template_name", "<unknown>"),
+            "matched": matched,
+            "keywords_matched": matched_kws,
+            "keywords_missing": missing_kws,
+            "exclude_keywords_matched": exclude_matched,
+            "exclude_triggered": exclude_triggered,
+            "match_ratio": ratio,
+            "reason": reason,
+        }
+
+    def diagnose_fields(
+        self, optimized_str: str, invoice_file: str = "", input_module: Any = None
+    ) -> dict[str, Any]:
+        """Diagnose field extraction results against optimized text.
+
+        Runs field parsers and reports which fields matched, their extracted
+        values, which fields were missing, and whether required fields are
+        satisfied.
+
+        Args:
+            optimized_str (str): The preprocessed text for this template.
+            invoice_file (str): Optional path to invoice file (for file-based plugins).
+            input_module (Any): Optional input module used.
+
+        Returns:
+            dict[str, Any]: Structured field diagnosis containing:
+                - template_name: str
+                - fields_matched: dict[str, Any]
+                - fields_missing: list[str]
+                - required_fields: list[str]
+                - required_fields_missing: list[str]
+                - success: bool
+                - output: dict[str, Any]
+                - error: str | None
+        """
+        output = _initialize_output_and_log(self, optimized_str)
+        fields_config = self.get("fields") or {}
+        declared_fields = list(fields_config.keys())
+        error_msg = None
+
+        try:
+            for k, v in fields_config.items():
+                if isinstance(v, dict):
+                    parser_settings = dict(v)
+                    pages = parser_settings.pop("pages", self.get("pages"))
+                    optimized_str_for_parser = _handle_area(
+                        self,
+                        parser_settings,
+                        input_module,
+                        invoice_file,
+                        optimized_str,
+                        pages,
+                    )
+                    if "parser" in parser_settings:
+                        _handle_parser(
+                            self, k, parser_settings, optimized_str_for_parser, output
+                        )
+                elif k.startswith("static_"):
+                    output[k.replace("static_", "")] = v
+                else:
+                    _handle_legacy_syntax(self, k, v, optimized_str, output)
+
+            output.setdefault("currency", self.options.get("currency", "EUR"))
+
+            for plugin_keyword, plugin_func in PLUGIN_MAPPING.items():
+                if plugin_keyword in self.keys():
+                    plugin_func.extract(self, optimized_str, output, invoice_file)
+
+            schema.normalize_line_fields(output)
+            unece_uom.normalize_lines_uom(output)
+            _apply_tax_to_lines(output)
+            _compute_line_tax(output)
+            _validate_tax_total(output, self.get("template_name"))
+            _validate_fields(self, output)
+        except Exception as exc:
+            error_msg = str(exc)
+
+        # Check required fields
+        if "required_fields" in self:
+            required = list(self["required_fields"])
+        else:
+            required = ["date", "amount", "invoice_number", "issuer"]
+
+        missing_required = [f for f in required if f not in output]
+        matched_fields = {k: v for k, v in output.items() if not k.startswith("_")}
+        missing_fields = [
+            k
+            for k in declared_fields
+            if k not in output and k.replace("static_", "") not in output
+        ]
+
+        return {
+            "template_name": self.get("template_name", "<unknown>"),
+            "fields_matched": matched_fields,
+            "fields_missing": missing_fields,
+            "required_fields": required,
+            "required_fields_missing": missing_required,
+            "success": len(missing_required) == 0 and error_msg is None,
+            "output": output,
+            "error": error_msg,
+        }
+
     def parse_number(self, value: str) -> float:
         """Parses a number from a string.
 
         This function parses a numerical value from a string, handling
-        different decimal separators and thousands separators based on locale.
+        different decimal separators, thousands separators, accounting
+        parentheses negatives, trailing minus signs, currency symbols, and
+        Unicode whitespace based on locale.
 
         Args:
             value (str): The string containing the number to be parsed.
@@ -215,16 +371,57 @@ class InvoiceTemplate(OrderedDictType[str, Any]):
             # Internal invariant: parsers upstream always hand us a string;
             # keep as a runtime TypeError (not asserting on hot path).
             raise TypeError(f"parse_number expected str, got {type(value).__name__}")
+
+        # Normalize unicode whitespace (non-breaking, narrow non-breaking, etc.)
+        cleaned = (
+            value.replace("\u00a0", " ")
+            .replace("\u202f", " ")
+            .replace("\u2007", " ")
+            .replace("\u200b", "")
+            .strip()
+        )
+
+        is_negative = False
+
+        # Accounting negative parentheses: (1,234.56) or ( 123.45 )
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            is_negative = True
+            cleaned = cleaned[1:-1].strip()
+
+        # Trailing negative sign: 120.00- or 120.00 − (U+2212)
+        if cleaned.endswith("-") or cleaned.endswith("\u2212"):
+            is_negative = True
+            cleaned = cleaned[:-1].strip()
+
+        # Leading negative sign: -120.00 or −120.00
+        if cleaned.startswith("-") or cleaned.startswith("\u2212"):
+            is_negative = True
+            cleaned = cleaned[1:].strip()
+
+        # Strip currency symbols and common currency codes
+        cleaned = _regex.sub(r"[\$€£¥₹₽₩₪¢]", "", cleaned).strip()
+        cleaned = _regex.sub(
+            r"(?i)^(?:USD|EUR|GBP|CAD|AUD|CHF|CNY|JPY)\s+",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = _regex.sub(
+            r"(?i)\s+(?:USD|EUR|GBP|CAD|AUD|CHF|CNY|JPY)$",
+            "",
+            cleaned,
+        ).strip()
+
         # Early exit if no thousands separator or custom decimal separator is present
-        if not any(char in value for char in r",.'\s"):
-            return float(value)
+        if not any(char in cleaned for char in r",.'\s"):
+            parsed = float(cleaned)
+            return -abs(parsed) if is_negative else parsed
 
         if not isinstance(self.options["decimal_separator"], str):
             raise TemplateSyntaxError(
                 "`options.decimal_separator` must be a string",
                 self.get("template_name"),
             )
-        if value.count(self.options["decimal_separator"]) >= 2:
+        if cleaned.count(self.options["decimal_separator"]) >= 2:
             raise TemplateSyntaxError(
                 "Decimal separator cannot appear more than once in a value",
                 self.get("template_name"),
@@ -235,13 +432,14 @@ class InvoiceTemplate(OrderedDictType[str, Any]):
 
         # Remove all possible thousands separators
         amount_no_thousand_sep = _regex.sub(
-            r"[\s']", "", value.replace(thousands_separator, "")
+            r"[\s']", "", cleaned.replace(thousands_separator, "")
         )
 
         # Replace the decimal separator with a dot
-        return float(
+        parsed = float(
             amount_no_thousand_sep.replace(str(self.options["decimal_separator"]), ".")
         )
+        return -abs(parsed) if is_negative else parsed
 
     def parse_date(self, value: str) -> Any:
         """Parses date and returns date after parsing."""

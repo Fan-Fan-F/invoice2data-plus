@@ -23,6 +23,7 @@ import click
 
 from invoice2data.api import DEFAULT_INPUT_READERS
 from invoice2data.api import Invoice2Data
+from invoice2data.api import explain_matching
 from invoice2data.api import extract_data
 from invoice2data.api import input_mapping
 from invoice2data.extract.loader import read_templates
@@ -382,6 +383,21 @@ def _run_new_template(
     help="If no template matches, extract fields with the configured AI provider "
     "(opt-in; see INVOICE2DATA_AI_* env vars).",
 )
+@click.option(
+    "--standardize-types",
+    is_flag=True,
+    help="Standardize outputs: convert amounts to Decimal and dates to ISO 8601 strings.",
+)
+@click.option(
+    "--use-decimal",
+    is_flag=True,
+    help="Convert monetary and numeric fields to Decimal.",
+)
+@click.option(
+    "--validate-schema",
+    is_flag=True,
+    help="Validate output against standard invoice JSON schema.",
+)
 @click.argument(
     "input_files",
     type=click.File("wb"),
@@ -410,6 +426,9 @@ def main(  # noqa: C901
     template_out: str | None,
     interactive: bool,
     ai_fallback: bool,
+    standardize_types: bool,
+    use_decimal: bool,
+    validate_schema: bool,
     input_files: tuple[Any, ...],
 ) -> None:
     """Extract data from PDF files and output it in a structured format."""
@@ -445,6 +464,9 @@ def main(  # noqa: C901
                 templates=templates,
                 input_module=input_module,
                 ai_fallback=ai_fallback,
+                standardize_types=standardize_types,
+                use_decimal=use_decimal,
+                validate_schema=validate_schema,
             )
             if res:
                 logger.info(res)
@@ -455,7 +477,12 @@ def main(  # noqa: C901
                         f.name, res, copy, move, filename_format
                     )  # Extract file processing and copy/move
             if explain:
-                _explain(f.name, res)
+                _explain(
+                    f.name,
+                    res,
+                    templates=templates,
+                    input_module=input_module,
+                )
         except Exception as e:  # noqa: PERF203
             logger.critical(
                 "Invoice2data failed to process %s. \nError message: %s", f.name, e
@@ -512,7 +539,12 @@ def _filter_templates(templates: list[Any], name: str) -> list[Any]:
     return matches
 
 
-def _explain(invoice_file: str, result: dict[str, Any]) -> None:
+def _explain(
+    invoice_file: str,
+    result: dict[str, Any],
+    templates: list[Any] | None = None,
+    input_module: Any = None,
+) -> None:
     """Print a per-file summary for ``--explain``.
 
     Deliberately writes to stdout (not the logger) so it renders cleanly even
@@ -522,11 +554,54 @@ def _explain(invoice_file: str, result: dict[str, Any]) -> None:
     Args:
         invoice_file (str): Path shown at the top of the block.
         result (dict[str, Any]): The ``extract_data`` return value (may be ``{}``).
+        templates (list[Any] | None): Templates used for extraction.
+        input_module (Any): Input module used.
     """
     click.echo(f"\n=== {invoice_file} ===")
     if not result:
         click.echo("  no template matched (or every match was missing required fields)")
+        # Perform deep diagnostic
+        report = explain_matching(
+            invoice_file, templates=templates, input_module=input_module
+        )
+        if report.get("reader"):
+            click.echo(
+                f"  [diagnostic] Backend: {report['reader']} "
+                f"(extracted {report['text_length']} chars)"
+            )
+        if report.get("matched_template"):
+            click.echo(
+                f"  [diagnostic] Template matched keywords: {report['matched_template']}"
+            )
+            field_diag = report.get("field_diagnostics")
+            if field_diag and field_diag.get("required_fields_missing"):
+                click.echo(
+                    f"  [diagnostic] MISSING REQUIRED FIELDS in {report['matched_template']}: "
+                    f"{', '.join(field_diag['required_fields_missing'])}"
+                )
+            if field_diag and field_diag.get("fields_missing"):
+                click.echo(
+                    f"  [diagnostic] Other declared fields not matched: "
+                    f"{', '.join(field_diag['fields_missing'])}"
+                )
+        else:
+            candidates = report.get("closest_candidates") or []
+            if candidates:
+                click.echo("  [diagnostic] Closest candidate templates:")
+                for cand in candidates[:3]:
+                    t_name = cand["template_name"]
+                    ratio_pct = int(cand["match_ratio"] * 100)
+                    click.echo(f"    - {t_name} (keyword match: {ratio_pct}%)")
+                    if cand["keywords_missing"]:
+                        click.echo(
+                            f"        Missing keywords: {', '.join(cand['keywords_missing'][:5])}"
+                        )
+                    if cand["exclude_triggered"]:
+                        click.echo(
+                            f"        Triggered exclude_keywords: {', '.join(cand['exclude_keywords_matched'])}"
+                        )
         return
+
     template_name = result.get("template_name", "<unknown>")
     click.echo(f"  matched: {template_name}")
     # Group fields: required-first, then everything else. Skip internal keys.

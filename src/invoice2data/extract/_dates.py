@@ -95,6 +95,32 @@ def _try_dateparser(
     return date_obj
 
 
+import re
+
+_PREFIX_RE = re.compile(
+    r"^(?:date|dated|datum|fecha|date\s*/\s*time)\s*[:：\-]\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_date_string(value: str) -> str:
+    """Preprocess date strings: normalize spaces, strip labels and punctuation."""
+    # Normalize unicode whitespace
+    cleaned = (
+        value.replace("\u00a0", " ")
+        .replace("\u202f", " ")
+        .replace("\u2007", " ")
+        .replace("\u200b", "")
+    )
+    # Collapse multiple whitespace
+    cleaned = " ".join(cleaned.split())
+    # Strip common leading labels like "Date:", "Datum:"
+    cleaned = _PREFIX_RE.sub("", cleaned).strip()
+    # Strip enclosing brackets/quotes
+    cleaned = cleaned.strip("[](){}<>\"'.,;")
+    return cleaned
+
+
 @lru_cache(maxsize=4096)
 def parse_date(
     value: str,
@@ -113,11 +139,13 @@ def parse_date(
     """
     if not value:
         return None
-    cleaned = value.strip()
+    cleaned = _clean_date_string(value)
+    if not cleaned:
+        return None
     result = _try_strptime(cleaned, date_formats)
     if result is not None:
         return result
     result = _try_dateutil(cleaned)
     if result is not None:
         return result
-    return _try_dateparser(value, date_formats, languages)
+    return _try_dateparser(cleaned, date_formats, languages)

@@ -7,6 +7,13 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from invoice2data.input import gvision
+import pytest
+
+if not gvision.have_google_cloud():
+    pytest.skip(
+        "google-cloud-vision and google-cloud-storage not installed",
+        allow_module_level=True,
+    )
 
 
 def test_to_text(mocker: "pytest_mock.MockerFixture") -> None:  # type: ignore [name-defined] # noqa

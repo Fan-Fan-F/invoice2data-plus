@@ -87,10 +87,16 @@ def to_text(path: str, area_details: dict[str, Any] | None = None) -> str:
         raise FileNotFoundError(f"File not found: {path}")
     # Check for dependencies. Needs Tesseract and Imagemagick installed.
     if not shutil.which("tesseract"):
-        raise OSError("tesseract not installed.")
+        raise OSError(
+            "tesseract not installed. Install tesseract-ocr: "
+            "'sudo apt-get install tesseract-ocr' (Debian/Ubuntu) or 'brew install tesseract' (macOS)."
+        )
     im_cmd = _imagemagick_cmd()
     if im_cmd is None:
-        raise OSError("imagemagick not installed.")
+        raise OSError(
+            "imagemagick not installed. Install imagemagick: "
+            "'sudo apt-get install imagemagick' (Debian/Ubuntu) or 'brew install imagemagick' (macOS)."
+        )
 
     language = get_languages()
     logger.debug("tesseract language arg is, %s", language)

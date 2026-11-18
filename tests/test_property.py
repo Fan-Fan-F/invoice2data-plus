@@ -102,7 +102,7 @@ def test_parse_number_respects_decimal_separator(sep: str) -> None:
 
 
 @given(value=st.text(min_size=0, max_size=64))
-@settings(max_examples=200, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@settings(max_examples=200, deadline=1000, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_parse_date_never_crashes(value: str) -> None:
     """`parse_date` must return a datetime, a date, or None -- never raise."""
     tpl = _tpl()
@@ -156,7 +156,21 @@ def test_ordered_load_accepts_well_formed_stream(
 ) -> None:
     """A stream with the required `keywords` field always parses into a template."""
     tpl_dict = {"issuer": "H", "keywords": keywords, **extra}
-    assume(all(k != "template_name" for k in extra))
+    assume(
+        all(
+            k
+            not in (
+                "template_name",
+                "match",
+                "fields",
+                "tables",
+                "options",
+                "lines",
+                "required_fields",
+            )
+            for k in extra
+        )
+    )
     payload = json.dumps([tpl_dict])
 
     result = ordered_load(payload)

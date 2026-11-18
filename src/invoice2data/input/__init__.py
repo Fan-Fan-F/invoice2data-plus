@@ -76,6 +76,136 @@ def is_available(module: ModuleType) -> bool:
     return bool(checker()) if callable(checker) else True
 
 
+#: Metadata and installation hints for registered backends.
+BACKEND_METADATA: dict[str, dict[str, Any]] = {
+    "pdftotext": {
+        "description": "Poppler pdftotext binary with -layout mode",
+        "type": "cli_tool",
+        "binary": "pdftotext",
+        "package": "poppler-utils",
+        "install_hints": {
+            "apt": "sudo apt-get install poppler-utils",
+            "brew": "brew install poppler",
+        },
+    },
+    "pdfium": {
+        "description": "Google PDFium renderer via pypdfium2 (fast, cross-platform)",
+        "type": "python_library",
+        "package": "pypdfium2",
+        "install_hints": {"pip": "pip install pypdfium2"},
+    },
+    "pdfoxide": {
+        "description": "Fast Rust-based PDF text extraction",
+        "type": "python_library",
+        "package": "pdf-oxide",
+        "install_hints": {"pip": "pip install pdf-oxide"},
+    },
+    "tesseract": {
+        "description": "Tesseract OCR engine with ImageMagick pre-conversion",
+        "type": "cli_tool",
+        "binary": "tesseract, convert/magick",
+        "package": "tesseract-ocr, imagemagick",
+        "install_hints": {
+            "apt": "sudo apt-get install tesseract-ocr imagemagick",
+            "brew": "brew install tesseract imagemagick",
+        },
+    },
+    "pdfminer": {
+        "description": "Pure Python PDF layout analyzer",
+        "type": "python_library",
+        "package": "pdfminer.six",
+        "install_hints": {"pip": "pip install pdfminer.six"},
+    },
+    "pdfplumber": {
+        "description": "pdfminer-backed layout and table extraction",
+        "type": "python_library",
+        "package": "pdfplumber",
+        "install_hints": {"pip": "pip install pdfplumber"},
+    },
+    "hotpdf": {
+        "description": "Fast bounding-box PDF extraction",
+        "type": "python_library",
+        "package": "hotpdf",
+        "install_hints": {"pip": "pip install hotpdf"},
+    },
+    "gvision": {
+        "description": "Google Cloud Vision OCR API",
+        "type": "cloud_service",
+        "package": "google-cloud-vision, google-cloud-storage",
+        "install_hints": {"pip": "pip install google-cloud-vision google-cloud-storage"},
+    },
+    "doctr": {
+        "description": "docTR deep learning OCR",
+        "type": "python_library",
+        "package": "python-doctr",
+        "install_hints": {"pip": "pip install python-doctr[torch]"},
+    },
+    "paddleocr": {
+        "description": "PaddlePaddle OCR",
+        "type": "python_library",
+        "package": "paddleocr, paddlepaddle",
+        "install_hints": {"pip": "pip install paddleocr paddlepaddle"},
+    },
+    "ocrmypdf": {
+        "description": "OCRmyPDF wrapper",
+        "type": "python_library",
+        "package": "ocrmypdf",
+        "install_hints": {"pip": "pip install ocrmypdf"},
+    },
+    "text": {
+        "description": "Plain text reader for .txt files",
+        "type": "builtin",
+        "package": None,
+        "install_hints": {},
+    },
+}
+
+
+def probe_backends() -> dict[str, dict[str, Any]]:
+    """Inspect all registered backends and return availability and install guidance.
+
+    Returns:
+        dict[str, dict[str, Any]]: Mapping of backend name to its detailed
+            status, including whether it is currently available, supports area,
+            supports page ranges, and install instructions if missing.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    for name, module in INPUT_MODULES.items():
+        avail = is_available(module)
+        meta = BACKEND_METADATA.get(name, {})
+        results[name] = {
+            "name": name,
+            "available": avail,
+            "supports_area": supports_area(module),
+            "supports_pages": supports_pages(module),
+            "type": meta.get("type", "unknown"),
+            "description": meta.get("description", ""),
+            "package": meta.get("package"),
+            "install_hints": meta.get("install_hints", {}),
+        }
+    return results
+
+
+def get_backend_status(name: str) -> dict[str, Any]:
+    """Get the status and install guidance for a specific backend.
+
+    Args:
+        name (str): The backend name (e.g. 'pdftotext', 'pdfium').
+
+    Returns:
+        dict[str, Any]: Detailed status of the specified backend.
+
+    Raises:
+        KeyError: If the backend name is not recognized.
+    """
+    if name not in INPUT_MODULES:
+        raise KeyError(
+            f"Unknown input backend {name!r}. Available backends: {', '.join(sorted(INPUT_MODULES.keys()))}"
+        )
+    all_statuses = probe_backends()
+    return all_statuses[name]
+
+
 @lru_cache(maxsize=128)
 def _cached_to_text(
     module: ModuleType,
